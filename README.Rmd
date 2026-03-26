@@ -1,13 +1,3 @@
----
-title: "README"
-author: "Tommaso Accornero"
-date: "2026-03-26"
-output: html_document
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
 # Telco Customer Churn — Supervised Learning
 
 A supervised learning analysis of the IBM Telco Customer Churn dataset,
