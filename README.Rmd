@@ -1,0 +1,125 @@
+---
+title: "README"
+author: "Tommaso Accornero"
+date: "2026-03-26"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Telco Customer Churn — Supervised Learning
+
+A supervised learning analysis of the IBM Telco Customer Churn dataset,
+applying classification and regression methods to predict customer churn
+and cumulative revenue. Developed as the final project for the
+**Advanced Modelling** course, Master in Computational Social Science,
+Universidad Carlos III de Madrid (2025–2026).
+
+------------------------------------------------------------------------
+
+## Project Structure
+
+```         
+├── Final_Project.qmd          # Main Quarto document (source)
+├── Final_Project.html         # Rendered HTML report (self-contained)
+├── Telco_Customer_Churn.csv   # Dataset
+└── README.md                  # This file
+```
+
+------------------------------------------------------------------------
+
+## Overview
+
+This project applies a full supervised learning pipeline to two parallel
+analytical tasks:
+
+**Classification** — Predicting which customers will churn, with
+emphasis on class imbalance handling and cost-sensitive learning.
+Methods include logistic regression with stepwise selection, LDA, QDA,
+k-Nearest Neighbours, Decision Trees, and Random Forests. A custom cost
+matrix (FN=50, FP=10) is used to derive a business-optimal
+classification threshold.
+
+**Regression** — Predicting log(TotalCharges) as a proxy for customer
+lifetime value, using service subscriptions, contract type, and
+demographics as predictors. Methods include OLS, Ridge, Lasso, Elastic
+Net, PCR, PLS, Regression Trees, and Random Forests.
+
+------------------------------------------------------------------------
+
+## Key Findings
+
+-   **Contract type** is the single strongest predictor in both tasks —
+    month-to-month customers are the highest churn risk and generate the
+    least cumulative revenue
+-   **Fiber optic internet** customers churn at 7.5× the rate of DSL
+    customers
+-   **Threshold adjustment** (0.5 → 0.30) reduces expected
+    misclassification cost by 31% before any model change
+-   **Resampling** (downsampling/upsampling) achieves the lowest
+    expected cost when retention capacity is unconstrained
+-   **Regularisation** (Ridge, Lasso, Elastic Net) offers no improvement
+    over OLS — the feature set is already parsimonious
+-   **Random Forest** is the only method to meaningfully beat OLS in
+    regression (RMSE 0.847 vs 0.888)
+
+------------------------------------------------------------------------
+
+## Requirements
+
+The analysis is written in R and rendered with Quarto. The following
+packages are required:
+
+``` r
+install.packages(c(
+  "tidyverse", "dplyr", "caret", "MASS", "e1071", "class",
+  "tree", "randomForest", "glmnet", "pls", "pROC",
+  "GGally", "patchwork"
+))
+```
+
+------------------------------------------------------------------------
+
+## Dataset
+
+**IBM Telco Customer Churn Dataset** - 7,043 customer records, 21
+variables - Binary classification target: `Churn` (Yes/No) - Regression
+target: `log(TotalCharges)`
+
+Sources: -
+[Kaggle](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) -
+[IBM
+Community](https://community.ibm.com/community/user/businessanalytics/blogs/steven-macko/2019/07/11/telco-customer-churn-1113)
+
+------------------------------------------------------------------------
+
+## How to Reproduce
+
+1.  Clone the repository
+2.  Place `Telco_Customer_Churn.csv` in the root directory
+3.  Open `Final_Project.qmd` in RStudio
+4.  Click **Render** or run:
+
+``` r
+quarto::quarto_render("Final_Project.qmd")
+```
+
+The output `Final_Project.html` is fully self-contained and can be
+opened in any browser without additional dependencies.
+
+------------------------------------------------------------------------
+
+## References
+
+Reichheld, F. F., & Schefter, P. (2000). E-loyalty: Your secret weapon
+on the Web. *Harvard Business Review*, 78(4), 105–113.
+
+IBM. (2019). *Telco Customer Churn Dataset*. IBM Community.
+
+------------------------------------------------------------------------
+
+## Author
+
+Tommaso Accornero Master in Computational Social Science — Universidad
+Carlos III de Madrid

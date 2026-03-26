@@ -1,0 +1,1326 @@
+---
+title: "Final_Project"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: false
+editor: visual
+---
+
+## 1. Introduction
+
+Customer churn is the decision of a customer to stop using a company's service, which is one of the most costly things to happen to a subscription-based company. Furthermore, in telecommunications, where customer acquisition costs substantially exceed retention costs, the ability to predict which customers are at risk of leaving before they actually leave is a core competitive advantage. Therefore, this is one of the key things these kind of companies look for. Retaining an existing customer has been estimated to cost five to twenty-five times less than acquiring a new one (Reichheld & Schefter, 2000), making churn prediction a direct driver of firm profitability.
+
+This project applies a series of supervised machine learning methods to the IBM Telco Customer Churn dataset, a widely used benchmark containing 7043 customer records across 21 variables capturing demographic attributes, type of services, type of subscriptions, billing characteristics, and customer tenure. The dataset presents two analytically interesting targets: Churn, a binary indicator of whether a customer left within the last month, and TotalCharges, a continuous measure of the amount billed to each customer during their whole tenure. The dataset is available at this link (https://www.kaggle.com/datasets/blastchar/telco-customer-churn/data) for whoever wants to download it directly, alternatively, it will be provided in the project's repository.
+
+The project revolves around two main parallel tasks. The **first one** is a classification problem: predicting which customers will churn, with particular focus towards the class imbalance that is inherent in churn data (more customers don't churn compared to those who do) and the asymmetric costs of false negatives versus false positives. The **second** is an advanced regression problem: predicting total charges, which reflects the pricing structure driven by the bundle of services a customer subscribes to.
+
+Throughout both tasks, the emphasis is placed not only on predictive accuracy, but also on interpretability, trying to connect model outputs back to actionable business insight.
+
+## 2. Data Cleaning and Descriptive Tools
+
+### 2.1 Setup
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(caret)
+library(MASS)
+library(e1071)
+library(class)
+library(tree)
+library(randomForest)
+library(glmnet)
+library(pls)
+library(pROC)
+library(GGally)
+library(patchwork)
+
+set.seed(123)
+```
+
+```{r}
+# Theoretical optimal threshold derived from a cost matrix
+# c01 = FP cost, c10 = FN cost, c00 = TN cost, c11 = TP cost
+theoretical_threshold <- function(c01, c10, c00 = 0, c11 = 0) {
+  numerator   <- c01 - c00
+  denominator <- (c01 - c00) + (c10 - c11)
+  if (denominator <= 0) stop("Invalid costs: denominator must be positive.")
+  numerator / denominator
+}
+
+# Expected cost from a cost matrix (rows = actual, cols = predicted)
+expected_cost <- function(pred, actual, cost_matrix, normalize = TRUE) {
+  actual <- factor(actual, levels = rownames(cost_matrix))
+  pred   <- factor(pred,   levels = colnames(cost_matrix))
+  cm     <- table(actual, pred)
+  total_cost <- sum(cm * cost_matrix)
+  if (normalize) total_cost / sum(cm) else total_cost
+}
+
+# Metric extractor from a confusionMatrix object
+extract_metrics <- function(cm_object, model_name) {
+  tibble(
+    Model             = model_name,
+    Accuracy          = as.numeric(cm_object$overall["Accuracy"]),
+    Sensitivity       = as.numeric(cm_object$byClass["Sensitivity"]),
+    Specificity       = as.numeric(cm_object$byClass["Specificity"]),
+    `Balanced Accuracy` = as.numeric(cm_object$byClass["Balanced Accuracy"])
+  )
+}
+```
+
+### 2.2 Loading the Data
+
+```{r}
+telco <- read.csv("Telco_Customer_Churn.csv", 
+                      stringsAsFactors = FALSE)
+
+dim(telco)
+glimpse(telco)
+```
+
+`dim()` shows us that the dataset has more than 7000 observations and 21 different variables. glipse() is giving us an overview of the variable types and we can see that all of them besides the clearly numerical ones (SeniorCitizen, tenure, MonthlyCharges, and TotalCharges), are character strings that will have to be converted into factors.
+
+### 2.3 Data Cleaning and String Conversion
+
+```{r}
+# SeniorCitizen is stored as 0/1 integer — convert to factor
+telco$SeniorCitizen <- factor(telco$SeniorCitizen, 
+                               levels = c(0, 1), 
+                               labels = c("No", "Yes"))
+
+# Convert all remaining character columns to factors
+telco <- telco %>%
+  mutate(across(where(is.character), as.factor))
+
+# Drop customerID (identifier, no predictive value)
+telco <- telco %>%
+  dplyr::select(-customerID)
+
+# Confirm factor conversion
+str(telco)
+```
+
+After conversion, every predictor should be either a **factor or numeric**. Churn is now a factor with levels "No" and "Yes". Tenure, MonthlyCharges, and TotalCharges remain numeric.
+
+One thing to note is that several service variables (OnlineSecurity, OnlineBackup, DeviceProtection, TechSupport, StreamingTV, StreamingMovies, MultipleLines) contain a third level such as "No internet service" or "No phone service" that is perfectly determined by InternetService and PhoneService respectively. These levels are collapsed into "No" to avoid multicollinearity in our models.
+
+```{r}
+# Collapse "No internet service" into "No" for all add-on service variables
+# These levels are perfectly collinear with InternetService == "No"
+internet_addons <- c("OnlineSecurity", "OnlineBackup", "DeviceProtection",
+                     "TechSupport", "StreamingTV", "StreamingMovies")
+
+telco <- telco %>%
+  mutate(across(all_of(internet_addons), 
+                ~ fct_recode(., "No" = "No internet service")))
+
+# Also collapse MultipleLines
+telco <- telco %>%
+  mutate(MultipleLines = fct_recode(MultipleLines, 
+                                     "No" = "No phone service"))
+```
+
+### 2.4 Missingness and Duplicates
+
+```{r}
+cat("Total NAs:", sum(is.na(telco)), "\n")
+cat("Duplicated rows:", sum(duplicated(telco)), "\n")
+
+# Inspect the 11 NA rows in TotalCharges
+telco[is.na(telco$TotalCharges), c("tenure", "MonthlyCharges", "TotalCharges")]
+
+# Drop NAs and Duplicates
+telco <- telco %>% filter(!is.na(TotalCharges))
+telco <- telco %>% distinct()
+
+cat("Observations after dropping NAs and duplicates:", nrow(telco), "\n")
+```
+
+All 11 NA rows correspond to customers with tenure = 0
+
+This means that they just signed up and have no billing history yet. Since they represent less than 0.2% of our dataset, dropping them is fully justified.
+
+In addition, we have deleted the 22 duplicate rows, bringing out total observations to 7,010
+
+### 2.5 Summary Statistics
+
+```{r}
+summary(telco)
+```
+
+The dataset contains **7010 customers after cleaning**, nearly split 50-50 by gender. The customer base is mostly non-senior (84%), with more customers without dependents (70%) nor partners (52%).
+
+Tenure ranges from 1 to 72 months with a median of 29, which tells us that we have a wide mix of new and longer standing customers. We believe that this could be very interesting for our predictions.
+
+MonthlyCharges shows meaningful spread (€18–€119, median €70), suggesting that the company has service bundles that span a lot across customers.
+
+The dominant internet service is Fiber optic (44%), followed by DSL (34%). Add-on services (online security, backup, device protection, tech support, streaming) are subscribed to by roughly 30% of customers each, with the majority not subscribing. These proportions reflect the 1,506 customers with no internet service being included in the "No" category alongside internet customers who simply chose not to add the service.
+
+Contract type skews heavily toward month-to-month (55%) as one year or two year together do not even reach month to month. This is important to flag early as this could be a strong churn predictor.
+
+The Churn distribution confirms the imbalance: 1857 churners (26.6%) vs. 5153 non-churners (73.4%). This rougly 1 to 3 ratio is the central challenge for the classification task and motivates the cost-sensitive methods in Section 4.
+
+### 2.6 Target Variable: Churn Distribution
+
+```{r, height = 10, width = 5}
+churn_counts <- telco %>%
+  count(Churn) %>%
+  mutate(prop = n / sum(n))
+
+print(churn_counts)
+
+ggplot(telco, aes(x = Churn, fill = Churn)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  scale_fill_manual(values = c("No" = "steelblue", "Yes" = "tomato")) +
+  labs(
+    title = "Distribution of Churn",
+    subtitle = "Target variable for the classification task",
+    x = "Churn",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+As mentioned before, the 3 to 1 ratio of No churners for every churner is what motivates the cost-sensitive methods in Section 4.
+
+### 2.7 Correlation Structure and Multicollinearity Check
+
+```{r}
+telco %>%
+  dplyr::select(tenure, MonthlyCharges, TotalCharges) %>%
+  ggcorr(label = TRUE, label_size = 4, hjust = 0.75) +
+  labs(title = "Correlation Matrix: Numeric Variables")
+```
+
+The correlation matrix shows us that we have a problem in our database structure: TotalCharges is nearly perfectly explained by the combination of tenure and MonthlyCharges.
+
+Being TotalCharges the product and composition of tenure and MonthlyCharges, it makes it redundant as a predictor next to the other two. If we were to include it alongside the other two, it would introduce severe multicollinearity in our regrassion models.
+
+That said, this makes TotalCharges a potentially interesting regression target: it captures cumulative customer revenue, and predicting it from service subscriptions, contract type, and demographics would be a meaningful business question.
+
+### 2.8 Target Variable: TotalCharges Distribution
+
+```{r}
+p1 <- ggplot(telco, aes(x = TotalCharges)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white", alpha = 0.85) +
+  labs(title = "TotalCharges (raw)", x = "Total Charges", y = "Count") +
+  theme_minimal()
+
+p2 <- ggplot(telco, aes(x = log(TotalCharges))) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white", alpha = 0.85) +
+  labs(title = "log(TotalCharges)", x = "log(Total Charges)", y = "Count") +
+  theme_minimal()
+
+p1 + p2
+```
+
+The distribution of TotalCharges shows a very strong right skew. This is likely driven by new customers with very low tenure accumulating near zero. It could either be that the company is fairly young, that a lot of customers do actually churn, or that most of them do not get charged premium services.
+
+Since the strong skewness, we decide to apply a log transformation that compresses the upper tail and makes the distribution more workable for regression. However, it does not produce a fully symmetric shape, matter of fact, it is quite left skewed, reflecting the underlying structure of the data as a product of two non-normal variables.
+
+That said, log(TotalCharges) remains the better choice as the regression target. It ensures us a stabile variance and reduces the influence of extreme values, and makes coefficient interpretation more natural as percentage changes rather than absolute dollar amounts.
+
+```{r}
+telco <- telco |> 
+  mutate(log_TotalCharges = log(TotalCharges))
+```
+
+### 2.9 Key Predictors by Churn
+
+```{r}
+ggplot(telco, aes(x = Contract, fill = Churn)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("No" = "steelblue", "Yes" = "tomato")) +
+  labs(title = "Churn Rate by Contract Type",
+       x = "Contract", y = "Proportion") +
+  theme_minimal()
+```
+
+As mentioned before, Month-to-Month shows the highest churning rate by quite a substantial amount.
+
+This makes sense as month to month contracts are less binding and more subject to temporal volatility.
+
+```{r}
+ggplot(telco, aes(x = Churn, y = tenure, fill = Churn)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("No" = "steelblue", "Yes" = "tomato")) +
+  labs(title = "Tenure by Churn Status",
+       x = "Churn", y = "Tenure (months)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+This is instead telling us that there is a clear pattern of customers with more tenure to be less likely to churn while novice customers tend to churn, specifically at a median of 10 months.
+
+```{r}
+ggplot(telco, aes(x = InternetService, fill = Churn)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("No" = "steelblue", "Yes" = "tomato")) +
+  labs(title = "Churn Rate by Internet Service Type",
+       x = "Internet Service", y = "Proportion") +
+  theme_minimal()
+```
+
+Fiber optic shows a disproportionately high churn rate relative to DSL. This reflects a price-to-value perception issue given the higher monthly charges associated with Fiber optic.
+
+### 2.10 Key Predictors by TotalCharges
+
+```{r}
+ggplot(telco, aes(x = Contract, y = log(TotalCharges), fill = Contract)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "log(TotalCharges) by Contract Type",
+       x = "Contract", y = "log(Total Charges)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+As expected, one and two-year contract customers generate substantially higher revenue compared to Month-to-Month. This confirms that contract type drives long-term value, not just churn risk, making it a key variable in both modelling tasks.
+
+```{r}
+ggplot(telco, aes(x = InternetService, y = log(TotalCharges), fill = InternetService)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "log(TotalCharges) by Internet Service Type",
+       x = "Internet Service", y = "log(Total Charges)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Fiber optic also gives us a slightly higher total charges despite its higher churn rate. Its high monthly cost but shorter tenure is worth flagging as a sneak peak for what the regression models will need to dissect.
+
+### 2.11 Train/Test Split
+
+```{r}
+in_train <- createDataPartition(telco$Churn, p = 0.80, list = FALSE)
+
+train_df <- telco[in_train, ]
+test_df  <- telco[-in_train, ]
+
+cat("Training set:", nrow(train_df), "observations\n")
+cat("Test set:", nrow(test_df), "observations\n")
+
+cat("\nChurn distribution in training set:\n")
+prop.table(table(train_df$Churn))
+
+cat("\nChurn distribution in test set:\n")
+prop.table(table(test_df$Churn))
+```
+
+Churn proportions are in both sets versy close to 26.6%. This preserves class balance.
+
+## 3. Classification — Interpretation
+
+### 3.1 Predictor Setup
+
+For the classification task, the target variable is `Churn`. We exclude `log_TotalCharges` and `TotalCharges` from the predictor set, since they are strongly collinear with `tenure` and `MonthlyCharges` and therefore would distort the coefficient interpretation
+
+```{r}
+churn_formula <- as.formula(
+  paste("Churn ~ . -", paste(c("TotalCharges", "log_TotalCharges"), 
+                              collapse = " - "))
+)
+```
+
+### 3.2 Logistic Regression with Stepwise Variable Selection
+
+We start with a baseline logistic regression to which we apply stepwise selection using AIC to identify the most relevant predictors.
+
+```{r}
+logit_full <- glm(churn_formula, 
+                  family = binomial(link = "logit"), 
+                  data = train_df)
+
+logit_step <- step(logit_full, direction = "both", trace = 0)
+
+summary(logit_step)
+```
+
+The stepwise procedure selects a reduced model by iteratively adding and removing variables based on AIC. Compared to the full model, the stepwise procedure drops gender, Partner, OnlineSecurity, OnlineBackup, and TechSupport, variables whose contribution to overall model fit did not justify their inclusion by AIC criteria. The retained 13 predictors are interpreted below.
+
+### 3.3 Odds Ratio Interpretation
+
+Logistic regression coefficients are on the log-odds scale, which is not intuitive by itself, but if we exponentiate them, they give us **odds ratios** and explain the multiplicative change in the odds of churning associated with a one-unit change in a predictor, holding all others constant.
+
+To explain: a value of 2 means the odds of churning are **twice as high**, a value of 0.5 means they are **halved**.
+
+In addition, we see the confidence interval to establish how certain we are of these estimates.
+
+```{r}
+odds_ratios <- exp(cbind(
+  `Odds Ratio` = coef(logit_step),
+  confint(logit_step)
+))
+
+knitr::kable(round(odds_ratios, 3), 
+             caption = "Odds Ratios with 95% Confidence Intervals")
+```
+
+The strongest churn driver is **internet service type**: Fiber optic customers have odds of churning 7.5 times higher than DSL customers (β = 2.014, OR = 7.49, p \< 0.001), while customers with no internet are 84% less likely to churn (β = -1.856, OR = 0.156, p \< 0.001). The wide confidence interval for Fiber optic (4.6–12.3) reflects the exponential transformation stretching the interval asymmetrically, however, the underlying log-odds estimate is precise.
+
+**Contract type** is the second most powerful predictor: two-year contract holders have 77% lower odds of churning versus month-to-month customers (β = -1.478, OR = 0.228, p \< 0.001), confirming it as the most effective retention mechanism available to the company.
+
+**Tenure** reduces churn odds by \~3.5% per additional month (β = -0.035, OR = 0.965, p \< 0.001). It is also the most precisely estimated effect in the model. While the per-month effect is modest, it compounds since its distribution is across the 1–72 month range observed before.
+
+**MonthlyCharges** is associated with slightly lower churn odds per unit increase (β = -0.043, OR = 0.958, p \< 0.001). This seems counterintuitive but it likely reflects that high-spending customers are on longer contracts or have more services to their name.
+
+**Streaming services** (StreamingMovies β = 0.719, OR = 2.05; StreamingTV β = 0.653, OR = 1.92) and **MultipleLines** (β = 0.547, OR = 1.73) are all associated with higher churn odds, however, it may be swallowed by Fiber optic customers, the highest-churn group. **DeviceProtection** (β = 0.279, OR = 1.32, p \< 0.01) and **PaperlessBilling** (β = 0.310, OR = 1.36, p \< 0.001) also increase churn odds significantly. **SeniorCitizen** customers are 23% more likely to churn (β = 0.208, OR = 1.23, p \< 0.05).
+
+**Electronic check** payment is associated with 43% higher churn odds (β = 0.361, OR = 1.43, p \< 0.001), possibly reflecting a less committed customer profile.
+
+Three variables are **not statistically significant** at the 5% level: `PaymentMethodCredit card` (β = 0.032, p = 0.80), `PaymentMethodMailed check` (β = -0.025, p = 0.84), and `PhoneServiceYes` (β = 0.352, p = 0.15) — their confidence intervals all cross 1. These were retained by the stepwise procedure because AIC evaluates overall model fit rather than individual significance. `DependentsYes` is marginal at p = 0.066.
+
+### 3.4 LDA and QDA
+
+We now apply **Linear Discriminant Analysis (LDA)** and **Quadratic Discriminant Analysis (QDA)** using the predictors selected by the stepwise procedure.
+
+```{r}
+selected_vars <- attr(terms(logit_step), "term.labels")
+selected_formula <- as.formula(
+  paste("Churn ~", paste(selected_vars, collapse = " + "))
+)
+
+# LDA
+lda_model <- lda(selected_formula, data = train_df)
+lda_pred  <- predict(lda_model, newdata = test_df)$class
+
+# QDA
+qda_model <- qda(selected_formula, data = train_df)
+qda_pred  <- predict(qda_model, newdata = test_df)$class
+```
+
+```{r}
+logit_step_prob <- predict(logit_step, newdata = test_df, type = "response")
+logit_step_pred <- factor(ifelse(logit_step_prob > 0.5, "Yes", "No"),
+                          levels = c("No", "Yes"))
+
+cm_logit <- confusionMatrix(logit_step_pred, test_df$Churn, positive = "Yes")
+cm_lda   <- confusionMatrix(lda_pred,        test_df$Churn, positive = "Yes")
+cm_qda   <- confusionMatrix(qda_pred,        test_df$Churn, positive = "Yes")
+
+cm_logit
+cm_lda
+cm_qda
+```
+
+### 3.5 Interpretation Summary
+
+```{r}
+interp_summary <- bind_rows(
+  extract_metrics(cm_logit, "Logistic (stepwise)"),
+  extract_metrics(cm_lda,   "LDA"),
+  extract_metrics(cm_qda,   "QDA")
+)
+
+knitr::kable(interp_summary, digits = 3,
+             caption = "Classification Performance: Interpretable Models")
+```
+
+**Overall accuracy is similar across all three models (76–80%)**, but this is misleading given the class imbalance. However, this only tells us a partial story.
+
+Logistic and LDA achieve *\~80% accuracy* but only *53–56% Sensitivity* but they miss nearly half of all actual churners, which is the real thing we are trying to predict and that is significative for companies.
+
+QDA sacrifices some accuracy (76%) but **raises Sensitivity to 77%** and achieves the highest Balanced Accuracy of 0.762. QDA outperforms the others because churners and non-churners likely have genuinely different covariance structures, which QDA captures while LDA cannot.
+
+Even if we improved with QDA, all three models **still miss a substantial share of churners**, which is what motivates us to adopt the cost-sensitive methods in Section 4.
+
+## 4. Classification — Modelling and Prediction
+
+### 4.1 The Imbalance Problem
+
+Before applying any correction, we demonstrate concretely what happens when a standard classifier is applied to imbalanced data without adjustment. A naive classifier that always predicts "No" would achieve 73% accuracy while detecting **zero churners**. Our 26.6% minority class means standard models optimised for accuracy are structurally biased toward the majority.
+
+```{r}
+logit_base_prob <- predict(logit_step, newdata = test_df, type = "response")
+logit_base_pred <- factor(ifelse(logit_base_prob > 0.5, "Yes", "No"),
+                          levels = c("No", "Yes"))
+
+cm_base <- confusionMatrix(logit_base_pred, test_df$Churn, positive = "Yes")
+cm_base
+```
+
+Out of 371 actual churners in the test set, the model correctly identifies only 198 (Sensitivity = 53.4%) and misses 173. These are False Negatives, which is a very negative metric for businesses as the cost of misinterpreting a churner is way higher than correctly identifying a loyal customer.
+
+The model does well in accuracy (79.94%) but it is inflated by our imbalanced dataset.
+
+### 4.2 Cost Matrix Definition
+
+These two types of error have very different business consequences:
+
+-   A **False Negative** (predicting a customer stays when they actually leave) means losing that customer entirely
+-   A **False Positive** (predicting churn when the customer would have stayed) means spending money on a retention offer unnecessarily
+
+We assign costs reflecting this asymmetry.
+
+```{r}
+cost_matrix <- matrix(c(
+  0,   10,
+  50,   0
+), nrow = 2, byrow = TRUE,
+dimnames = list(
+  Actual    = c("No", "Yes"),
+  Predicted = c("No", "Yes")
+))
+
+print(cost_matrix)
+
+p_star <- theoretical_threshold(c01 = 10, c10 = 50)  # gives 0.167
+cat("Theoretical optimal threshold:", round(p_star, 3), "\n")
+```
+
+We assign a False Negative cost of 50 and a False Positive cost of 10, reflecting that missing a churner is five times more damaging than unnecessarily offering a retention discount to a loyal customer.
+
+At first we thought of assigning a FN cost of 100 but that gave us a theoretical threshold of 0.091 which we deemed to be too aggressive and basically flag everyone as a churner. Our updated theoretical optimal threshold of p = 0.167\* is more moderate but still lower than the default 0.5, meaning we should classify customers as at-risk at a lower probability than standard practice to minimise total expected cost.
+
+### 4.3 Threshold Adjustment and ROC Curve
+
+```{r}
+thresholds <- seq(0.05, 0.95, by = 0.05)
+
+threshold_results <- map_dfr(thresholds, function(thresh) {
+  pred <- factor(ifelse(logit_base_prob > thresh, "Yes", "No"),
+                 levels = c("No", "Yes"))
+  cm   <- confusionMatrix(pred, test_df$Churn, positive = "Yes")
+  tibble(
+    Threshold         = thresh,
+    Sensitivity       = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity       = as.numeric(cm$byClass["Specificity"]),
+    `Balanced Accuracy` = as.numeric(cm$byClass["Balanced Accuracy"]),
+    Expected_Cost     = expected_cost(pred, test_df$Churn, cost_matrix)
+  )
+})
+
+threshold_results %>%
+  pivot_longer(cols = c(Sensitivity, Specificity, `Balanced Accuracy`),
+               names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(x = Threshold, y = Value, color = Metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  geom_vline(xintercept = p_star, linetype = "dashed", color = "black") +
+  annotate("text", x = p_star + 0.05, y = 0.3,
+           label = paste0("p* = ", round(p_star, 2)), size = 3.5) +
+  labs(title = "Classification Metrics vs Decision Threshold",
+       x = "Threshold", y = "Metric Value") +
+  theme_minimal()
+```
+
+**Plot 1** shows the fundamental trade-off between Sensitivity and Specificity as the threshold moves. Lowering the threshold from 0.5 increases Sensitivity — more actual churners are caught — but reduces Specificity, as more loyal customers are incorrectly flagged. The theoretical threshold p\* = 0.167 sits in the high-Sensitivity region. The two curves **converge at approximately 0.30**, where Sensitivity and Specificity are roughly equal — this is the point of balanced error rates and where Balanced Accuracy peaks.
+
+```{r}
+ggplot(threshold_results, aes(x = Threshold, y = Expected_Cost)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 1.5) +
+  geom_vline(xintercept = 0.15, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.25,
+           y = max(threshold_results$Expected_Cost) * 0.9,
+           label = "Minimum = 0.15",
+           color = "red", size = 3.5) +
+  labs(title = "Expected Cost vs Decision Threshold",
+       subtitle = "Minimising total misclassification cost",
+       x = "Threshold", y = "Expected Cost per Observation") +
+  theme_minimal()
+
+cat("Cost-optimal threshold (grid minimum):", 
+    threshold_results$Threshold[which.min(threshold_results$Expected_Cost)], "\n")
+cat("Minimum expected cost:", 
+    round(min(threshold_results$Expected_Cost), 4), "\n")
+cat("Expected cost at threshold 0.25:", 
+    round(threshold_results$Expected_Cost[threshold_results$Threshold == 0.25], 4), "\n")
+cat("Theoretical threshold from cost matrix:", round(p_star, 3), "\n")
+```
+
+**Plot 2** translates the metric trade-off into business terms. The grid minimum is at **0.15**, close to the theoretical p\* = 0.167, confirming the cost matrix derivation empirically. However, the curve flattens a lot between **0.10 and 0.30** therefore the cost difference between threshold 0.15 and 0.30 is negligible. Cost only rises steeply beyond 0.35, where missed churners start accumulating rapidly.
+
+```{r}
+roc_obj <- roc(test_df$Churn, logit_base_prob,
+               levels = c("No", "Yes"))
+
+plot(roc_obj,
+     main = "ROC Curve — Logistic Regression",
+     print.thres = TRUE,
+     print.thres.pattern = "Thresh: %.2f\nSens: %.2f\nSpec: %.2f")
+
+cat("AUC:", round(auc(roc_obj), 4), "\n")
+
+youden_coords <- coords(roc_obj, "best",
+                        ret = c("threshold", "sensitivity", "specificity"))
+cat("Youden optimal threshold:", round(youden_coords$threshold, 3), "\n")
+```
+
+**Plot 3** shows the ROC curve:the full Sensitivity/Specificity trade-off across every possible threshold simultaneously, without any cost assumption. The AUC measures overall discriminative ability: a value close to 1 means the model reliably ranks churners above non-churners regardless of threshold. The marked point at **threshold = 0.30** is Youden's J optimum, which maximises Sensitivity + Specificity simultaneously (0.77/0.77) treating both errors as equally important. This gives us a third independent signal converging near the 0.25–0.30 region.
+
+```{r}
+optimal_cost_thresh <- 0.30
+
+logit_cost_pred <- factor(
+  ifelse(logit_base_prob > optimal_cost_thresh, "Yes", "No"),
+  levels = c("No", "Yes")
+)
+
+cm_cost <- confusionMatrix(logit_cost_pred, test_df$Churn, positive = "Yes")
+cm_cost
+```
+
+Three independent approaches converge on the same region: the **cost matrix formula** yields p\* = 0.167, the **empirical cost grid** finds its minimum at 0.15 (but flattens between 0.10 and 0.30, meaning that there is negligible penalty), plot 1 shows a crossing at 0.30 and **Youden's J** suggests 0.30.
+
+Therefore, since 2 plots out of three specifically mentions this threshold and we see a very little loss in cost, we adopt **threshold = 0.30** as the final operating threshold. Compared to the baseline at 0.5, this threshold substantially improves Sensitivity.
+
+### 4.4 Resampling Strategies
+
+We apply both downsampling and upsampling to compare against the threshold adjustment approach from Section 4.3.
+
+```{r resampling, warning=FALSE, message=FALSE}
+# Downsampling: randomly remove majority class observations during training
+ctrl_down <- trainControl(
+  method          = "cv",
+  number          = 5,
+  sampling        = "down",
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+set.seed(123)
+logit_down <- train(
+  selected_formula,
+  data      = train_df,
+  method    = "glm",
+  family    = "binomial",
+  trControl = ctrl_down,
+  metric    = "ROC"
+)
+
+# Upsampling: randomly duplicate minority class observations during training
+ctrl_up <- trainControl(
+  method          = "cv",
+  number          = 5,
+  sampling        = "up",
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+set.seed(123)
+logit_up <- train(
+  selected_formula,
+  data      = train_df,
+  method    = "glm",
+  family    = "binomial",
+  trControl = ctrl_up,
+  metric    = "ROC"
+)
+
+# Predict on test set at threshold 0.30
+down_prob <- predict(logit_down, newdata = test_df, type = "prob")[, "Yes"]
+up_prob   <- predict(logit_up,   newdata = test_df, type = "prob")[, "Yes"]
+
+down_pred <- factor(ifelse(down_prob > 0.30, "Yes", "No"), levels = c("No", "Yes"))
+up_pred   <- factor(ifelse(up_prob   > 0.30, "Yes", "No"), levels = c("No", "Yes"))
+
+cm_down <- confusionMatrix(down_pred, test_df$Churn, positive = "Yes")
+cm_up   <- confusionMatrix(up_pred,   test_df$Churn, positive = "Yes")
+
+cat("--- Downsampled Logistic (threshold 0.30) ---\n")
+print(cm_down)
+cat("\n--- Upsampled Logistic (threshold 0.30) ---\n")
+print(cm_up)
+```
+
+```{r resampling-comparison, fig.width=9, fig.height=5}
+# Build comparison table across the four logistic variants
+resamp_summary <- bind_rows(
+  extract_metrics(cm_base,  "Baseline (threshold 0.5)"),
+  extract_metrics(cm_cost,  "Threshold adjustment (0.30)"),
+  extract_metrics(cm_down,  "Downsampling + threshold 0.30"),
+  extract_metrics(cm_up,    "Upsampling + threshold 0.30")
+) %>%
+  mutate(
+    `Expected Cost` = c(
+      expected_cost(logit_base_pred, test_df$Churn, cost_matrix),
+      expected_cost(logit_cost_pred, test_df$Churn, cost_matrix),
+      expected_cost(down_pred,       test_df$Churn, cost_matrix),
+      expected_cost(up_pred,         test_df$Churn, cost_matrix)
+    )
+  )
+
+knitr::kable(resamp_summary, digits = 3,
+             caption = "Resampling Strategies vs Threshold Adjustment")
+
+# Visualise the Sensitivity/Specificity tradeoff
+resamp_summary %>%
+  dplyr::select(Model, Sensitivity, Specificity) %>%
+  pivot_longer(cols      = c(Sensitivity, Specificity),
+               names_to  = "Metric",
+               values_to = "Value") %>%
+  ggplot(aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Sensitivity" = "tomato",
+                                "Specificity"  = "steelblue")) +
+  coord_flip() +
+  labs(title = "Sensitivity vs Specificity: Imbalance Correction Strategies",
+       x = NULL, y = "Value") +
+  theme_minimal()
+```
+
+The resampling results reveal a meaningful difference from threshold adjustment alone.
+
+Both **downsampling and upsampling push Sensitivity to \~93%** — catching nearly every churner — but at the cost of **Specificity *dropping* to 55%**, meaning nearly half of loyal customers are incorrectly flagged. Accuracy falls to 65%, below the no-information rate of 73.5%, but this is expected when aggressively prioritising the minority class.
+
+Under our cost matrix (FN = 50, FP = 10), this trade-off pays off: fewer missed churners at the cost of more unnecessary retention offers produces a lower expected cost than threshold adjustment alone. Whether this is operationally preferable depends on whether the business has the budget to act on a much larger pool of flagged customers. If retention offers are unlimited, use resampling. If there is a fixed budget, threshold adjustment at 0.30 is the better choice — its higher Specificity means fewer wasted offers.
+
+All three corrected approaches substantially outperform the uncorrected baseline.
+
+**The choice between them is a business decision, not a modelling one.**
+
+### 4.5 k-Nearest Neighbours
+
+With kNN we are asking *"of the k customers most similar to this one, how many churned?"*
+
+```{r knn, warning=FALSE, message=FALSE, fig.width=7, fig.height=5}
+# A Kappa-tuned k favours tighter local neighbourhoods that are
+# more sensitive to the minority class distribution.
+
+ctrl_knn <- trainControl(method = "cv", number = 5)
+
+knn_grid <- data.frame(k = c(1, 3, 5, 7, 9, 11, 15, 20,
+                               25, 30, 40, 50, 75, 100))
+
+set.seed(123)
+knn_model <- train(
+  Churn ~ . - TotalCharges - log_TotalCharges,
+  data       = train_df,
+  method     = "knn",
+  preProcess = c("center", "scale"),
+  trControl  = ctrl_knn,
+  tuneGrid   = knn_grid,
+  metric     = "Kappa"
+)
+
+best_k <- knn_model$bestTune$k
+cat("Best k selected by CV (Kappa):", best_k, "\n")
+
+ggplot(knn_model$results, aes(x = k, y = Kappa)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_vline(xintercept = best_k, linetype = "dashed", color = "red") +
+  labs(title = "k-NN Tuning: CV Kappa by k",
+       x = "k", y = "CV Kappa") +
+  theme_minimal()
+
+# Predict at threshold 0.30
+knn_prob <- predict(knn_model, newdata = test_df, type = "prob")[, "Yes"]
+knn_pred <- factor(ifelse(knn_prob > 0.30, "Yes", "No"),
+                   levels = c("No", "Yes"))
+
+cm_knn <- confusionMatrix(knn_pred, test_df$Churn, positive = "Yes")
+cm_knn
+```
+
+The Kappa curve rises steeply until k = 40, where it peaks at 0.44, then plateaus, this means that **any value in the k = 25–75 range performs similarly**, confirming genuine convergence rather than a sharp optimum.
+
+At threshold 0.30, kNN achieves Sensitivity of 0.803 and Specificity of 0.696, with a Balanced Accuracy of 0.750. It catches the highest raw number of actual churners among all models so far, but at the cost of flagging 313 loyal customers unnecessarily, the largest false positive count in the comparison.
+
+Accuracy of 72.5% sits just below the no-information rate, reflecting how aggressively the threshold-adjusted probabilities push toward the minority class.
+
+**kNN's strength here is its sensitivity**. Its weakness is precision: only 49% of customers it flags actually churn. Whether that trade-off is acceptable depends on the cost of a retention offer relative to the cost of losing a customer, exactly the business question the cost matrix formalises.
+
+### 4.6 Decision Tree
+
+A decision tree splits the predictor space into regions using a sequence of binary rules.
+
+```{r}
+tree_big <- tree(
+  Churn ~ . - TotalCharges - log_TotalCharges,
+  data    = train_df,
+  control = tree.control(nobs = nrow(train_df), mindev = 0, minsize = 5)
+)
+
+set.seed(123)
+tree_cv <- cv.tree(tree_big, FUN = prune.misclass)
+
+tibble(size = tree_cv$size, cv_error = tree_cv$dev) %>%
+  ggplot(aes(x = size, y = cv_error)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  labs(title = "Pruning Curve: CV Misclassification vs Tree Size",
+       x = "Number of Terminal Nodes",
+       y = "CV Misclassification Count") +
+  theme_minimal()
+```
+
+The pruning curve drops sharply within the first few terminal nodes and remains flat thereafter, indicating that a compact tree captures most of the predictive signal. The smallest tree achieving minimum CV error is selected following this principle.
+
+```{r}
+min_dev   <- min(tree_cv$dev, na.rm = TRUE)
+best_size <- min(tree_cv$size[tree_cv$dev == min_dev], na.rm = TRUE)
+cat("Optimal tree size:", best_size, "terminal nodes\n")
+
+tree_pruned <- prune.misclass(tree_big, best = best_size)
+
+plot(tree_pruned)
+text(tree_pruned, pretty = 0, cex = 0.75)
+title(paste("Pruned Tree —", best_size, "terminal nodes"))
+
+tree_prob <- predict(tree_pruned, newdata = test_df, type = "vector")[, "Yes"]
+tree_pred <- factor(ifelse(tree_prob > 0.30, "Yes", "No"), levels = c("No", "Yes"))
+cm_tree   <- confusionMatrix(tree_pred, test_df$Churn, positive = "Yes")
+cm_tree
+```
+
+Split 1 — Contract type (root): The single most discriminating predictor is contract type. Customers on One year or Two year contracts go left → immediately classified as No churn. This alone resolves a large portion of the dataset. Month-to-month customers go right and need further examination.
+
+Split 2 — Internet Service: Among month-to-month customers, those with DSL or No internet go left → classified as No churn. Only Fiber optic month-to-month customers go right — already the highest-risk profile.
+
+Split 3 — Tenure \< 13.5 months: Among Fiber optic month-to-month customers, those with tenure under 13.5 months are classified as Yes churn. Those with longer tenure are classified as No churn.
+
+Therefore, we have an actionable insight: **new Fiber optic month-to-month customers are the priority target for retention offers.**
+
+### 4.7 Random Forest
+
+A random forest corrects the main weakness of a single tree which are instability and overfitting by averaging predictions across hundreds of trees.
+
+```{r}
+p_class <- sum(!names(train_df) %in% c("Churn", "TotalCharges", "log_TotalCharges"))
+
+set.seed(123)
+rf_model <- randomForest(
+  Churn ~ . - TotalCharges - log_TotalCharges,
+  data       = train_df,
+  mtry       = floor(sqrt(p_class)),
+  ntree      = 500,
+  importance = TRUE
+)
+
+print(rf_model)
+
+rf_prob <- predict(rf_model, newdata = test_df, type = "prob")[, "Yes"]
+rf_pred <- factor(ifelse(rf_prob > 0.30, "Yes", "No"), levels = c("No", "Yes"))
+cm_rf   <- confusionMatrix(rf_pred, test_df$Churn, positive = "Yes")
+cm_rf
+```
+
+The Random Forest achieves Sensitivity of 0.71, Specificity of 0.75, and Balanced Accuracy of 0.733 at threshold 0.30.
+
+While the OOB class error for churners appears high (47%), this reflects evaluation at the default 0.5 threshold internally — consistent with what we observed for all models before threshold adjustment. At 0.30, the RF performs competitively but does not outperform the threshold-adjusted logistic regression. This is not unusual for tabular datasets with predominantly categorical predictors, where linear models often match ensemble methods when relationships are well-captured by the feature set. The RF's value here lies less in raw predictive performance and more in the variable importance plot, which provides model-agnostic confirmation of the key churn drivers identified across all methods.
+
+```{r}
+varImpPlot(rf_model,
+           main = "Random Forest — Variable Importance",
+           cex  = 0.8)
+```
+
+The variable importance plot confirms strong consistency across methods. Tenure is the dominant predictor on both metrics, followed by Contract and MonthlyCharges. This mirrors exactly what the logistic regression odds ratios and the pruned tree identified, providing robust evidence that these three variables are the genuine drivers of churn rather than artifacts of any single modelling approach.
+
+### 4.8 Final Model Comparison
+
+```{r final-comparison, fig.width=9, fig.height=6}
+# Recreate LDA and QDA predictions at threshold 0.30
+lda_prob   <- predict(lda_model, newdata = test_df)$posterior[, "Yes"]
+lda_pred_t <- factor(ifelse(lda_prob > 0.30, "Yes", "No"),
+                     levels = c("No", "Yes"))
+cm_lda_t   <- confusionMatrix(lda_pred_t, test_df$Churn, positive = "Yes")
+
+qda_prob   <- predict(qda_model, newdata = test_df)$posterior[, "Yes"]
+qda_pred_t <- factor(ifelse(qda_prob > 0.30, "Yes", "No"),
+                     levels = c("No", "Yes"))
+cm_qda_t   <- confusionMatrix(qda_pred_t, test_df$Churn, positive = "Yes")
+
+# Full comparison table
+all_results <- bind_rows(
+  extract_metrics(cm_base,   "Logistic — baseline (0.5)"),
+  extract_metrics(cm_cost,   "Logistic — threshold 0.30"),
+  extract_metrics(cm_down,   "Logistic — downsampled (0.30)"),
+  extract_metrics(cm_up,     "Logistic — upsampled (0.30)"),
+  extract_metrics(cm_lda_t,  "LDA — threshold 0.30"),
+  extract_metrics(cm_qda_t,  "QDA — threshold 0.30"),
+  extract_metrics(cm_knn,    paste0("kNN (k=", best_k, ") — threshold 0.30")),
+  extract_metrics(cm_tree,   paste0("Decision Tree (", best_size,
+                                    " nodes) — threshold 0.30")),
+  extract_metrics(cm_rf,     "Random Forest — threshold 0.30")
+) %>%
+  mutate(
+    `Expected Cost` = c(
+      expected_cost(logit_base_pred, test_df$Churn, cost_matrix),
+      expected_cost(logit_cost_pred, test_df$Churn, cost_matrix),
+      expected_cost(down_pred,       test_df$Churn, cost_matrix),
+      expected_cost(up_pred,         test_df$Churn, cost_matrix),
+      expected_cost(lda_pred_t,      test_df$Churn, cost_matrix),
+      expected_cost(qda_pred_t,      test_df$Churn, cost_matrix),
+      expected_cost(knn_pred,        test_df$Churn, cost_matrix),
+      expected_cost(tree_pred,       test_df$Churn, cost_matrix),
+      expected_cost(rf_pred,         test_df$Churn, cost_matrix)
+    )
+  ) %>%
+  arrange(`Expected Cost`)
+
+knitr::kable(all_results, digits = 3,
+             caption = "Full Classification Model Comparison (sorted by Expected Cost)")
+```
+
+```{r final-comparison-plot, fig.width=9, fig.height=6}
+# Visual summary
+all_results %>%
+  ggplot(aes(x    = reorder(Model, -`Expected Cost`),
+             y    = `Expected Cost`,
+             fill = `Expected Cost`)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "steelblue", high = "tomato") +
+  labs(title = "Expected Cost by Model (lower is better)",
+       x     = NULL,
+       y     = "Expected Cost per Observation") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The comparison table, sorted by Expected Cost, tells a clear and complete story across nine models. Three groups emerge naturally.
+
+**Group 1 — Resampling models (Expected Cost 4.23–4.30):** Downsampled and upsampled logistic regression rank first and second. As established in Section 4.4, this comes at a cost: Specificity of only 0.55 means nearly half of loyal customers are incorrectly flagged. They win on expected cost precisely because our cost matrix heavily penalises False Negatives (50) far more heavily than False Positives (10), catching 93% of churners justifies the flood of false alarms under these assumptions.
+
+**Group 2 — Corrected probabilistic models (4.58–4.98):** QDA, threshold-adjusted logistic, kNN, and LDA all cluster here. QDA achieves the best Balanced Accuracy within this group (0.759) and the lowest expected cost (4.575), confirming that churners and non-churners have genuinely different covariance structures that a flexible boundary captures better. The threshold-adjusted logistic achieves the highest Balanced Accuracy overall (0.767) the most equal trade-off between catching churners and avoiding false alarms, making it the preferred choice when the business faces a fixed retention budget.
+
+**Group 3 — Underperformers (5.63–6.95):** Random Forest, Decision Tree, and the uncorrected baseline all rank at the bottom. The RF underperforming every corrected linear model confirms that the churn signal in this dataset is predominantly linear.
+
+The uncorrected baseline at 6.945 quantifies exactly what ignoring class imbalance costs **any correction reduces expected cost by at least 30%**.
+
+**Recommended model:** downsampled or upsampled logistic if minimising financial loss is the sole objective and retention capacity is unconstrained.
+
+Threshold-adjusted logistic regression if interpretability or a fixed retention budget are priorities.
+
+## 5. Advanced Regression — Interpretation
+
+### 5.1 Predictor Setup
+
+For the regression task the target variable is `log_TotalCharges`. As established in Section 2.7, `tenure`, `MonthlyCharges`, and `TotalCharges` are excluded from the predictor set — they mechanically construct the target and including them would be leakage. The genuine predictors are the service subscriptions, contract type, payment method, and demographic variables.
+
+```{r}
+reg_formula <- as.formula(
+  paste("log_TotalCharges ~ . -", 
+        paste(c("TotalCharges", "Churn", "tenure", "MonthlyCharges"), 
+              collapse = " - "))
+)
+```
+
+### 5.2 OLS Baseline
+
+We begin with a standard OLS regression. This gives us an interpretable benchmark and a first look at which service and demographic variables are associated with higher cumulative revenue.
+
+```{r}
+ols_full <- lm(reg_formula, data = train_df)
+summary(ols_full)
+```
+
+The model explains 64.7% of variance in log(TotalCharges) using only service subscriptions, contract type, and demographics — without tenure or monthly charges. This is a strong result given those exclusions, confirming that the structure of a customer's service bundle is genuinely predictive of long-term revenue.
+
+Contract type dominates. A two-year contract is associated with 222% higher TotalCharges than a month-to-month customer (e\^1.170 ≈ 3.22), and a one-year contract with 166% higher (e\^0.980 ≈ 2.66), both highly significant (p \< 0.001). This is the single strongest structural driver of cumulative revenue — entirely consistent with the EDA and classification findings.
+
+Service add-ons all increase revenue as expected. The largest effects are MultipleLines (+72%, p \< 0.001) and OnlineBackup (+52%, p \< 0.001). Fiber optic internet is associated with 58% higher charges versus DSL, while no internet reduces charges by 33%. Mailed check customers have 41% lower TotalCharges than bank transfer customers (p \< 0.001), and electronic check 27% lower — likely reflecting that these customers tend toward shorter-tenure, month-to-month arrangements.
+
+Gender is the only non-significant variable (p = 0.53) — it has no meaningful relationship with cumulative revenue. DependentsYes is marginally significant (p = 0.07) and will likely be dropped by stepwise selection.
+
+```{r}
+ols_pred <- predict(ols_full, newdata = test_df)
+postResample(pred = ols_pred, obs = test_df$log_TotalCharges)
+```
+
+The OLS model achieves R² = 0.659 on the test set, explaining approximately two-thirds of variance in log(TotalCharges) using service and demographic predictors alone — a strong result given that the mechanical drivers (tenure and monthly charges) were intentionally excluded. The dominant finding is contract type: two-year customers generate roughly three times the cumulative revenue of month-to-month customers, holding all other service subscriptions constant. All service add-ons contribute positively and significantly, while gender is the only predictor that contributes nothing. The overall model is highly significant (F-statistic = 512, p \< 0.001), confirming that service structure is a genuine determinant of long-term customer value.
+
+### 5.3 Stepwise Variable Selection
+
+We apply bidirectional AIC stepwise selection to identify the most relevant predictors, mirroring the approach used in the classification task.
+
+```{r}
+ols_step <- step(ols_full, direction = "both", trace = 0)
+summary(ols_step)
+```
+
+```{r}
+step_pred <- predict(ols_step, newdata = test_df)
+postResample(pred = step_pred, obs = test_df$log_TotalCharges)
+```
+
+```{r}
+step_coefs <- data.frame(
+  Coefficient = coef(ols_step),
+  `Std. Error` = sqrt(diag(vcov(ols_step)))
+) %>%
+  rownames_to_column("Variable") %>%
+  filter(Variable != "(Intercept)") %>%
+  arrange(desc(abs(Coefficient))) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+knitr::kable(step_coefs,
+             caption = "Stepwise OLS Coefficients (sorted by magnitude)")
+```
+
+The stepwise procedure **drops only gender** from the full model, leaving R² and RMSE essentially unchanged (R² = 0.647, RMSE = 0.888). This confirms that the full model was already parsimonious — no redundant variables were being retained at the cost of fit.
+
+The coefficient table, sorted by magnitude, tells a clear story about what drives long-term customer revenue. Contract type occupies the top two positions by a wide margin: two-year contracts are associated with 222% higher TotalCharges (e\^1.170 - 1) and one-year contracts with 166% higher (e\^0.980 - 1) compared to month-to-month customers, holding all service subscriptions constant. This is the dominant structural driver of cumulative revenue.
+
+MultipleLines (+72%) and Mailed check payment (-41%) rank third and fourth — in opposite directions. The mailed check penalty likely proxies for customer commitment: less engaged customers who avoid automatic payments also tend to churn earlier, generating lower total charges. Fiber optic internet (+58%) and OnlineBackup (+52%) follow, reflecting the premium pricing of these services.
+
+Two variables are not significant at the 5% level: PaymentMethodCredit card (p = 0.32) and DependentsYes (p = 0.07). The stepwise procedure retained DependentsYes because AIC weighs overall model fit rather than individual p-values — its marginal contribution is small but not zero.
+
+The overall model is highly significant (F = 539, p \< 0.001). The R² of 0.647 represents a strong result given that tenure and monthly charges — the mechanical determinants of TotalCharges — were intentionally excluded. What remains is the genuinely structural component of long-term customer value driven by service choices.
+
+### 5.4 Checking OLS Assumptions
+
+Before moving to regularisation methods, we briefly check the key OLS assumptions.
+
+```{r}
+par(mfrow = c(2, 2))
+plot(ols_step)
+par(mfrow = c(1, 1))
+```
+
+The diagnostic plots reveal two violations worth flagging. First, heteroscedasticity: both the Residuals vs Fitted and Scale-Location plots show that residual variance is higher at lower fitted values and decreases at higher ones. This is consistent with the left-skewed nature of log(TotalCharges) noted in Section 2.8 — new customers with low predicted values show more variable behaviour than long-tenured high-value customers. The violation does not invalidate the model at this sample size — with n=5,609 training observations, the Central Limit Theorem makes coefficient estimates and inference robust to mild non-normality and heteroscedasticity. No influential observations are detected in the Residuals vs Leverage plot. These findings motivate the regularisation and tree-based methods in Section 6, which do not rely on the homoscedasticity assumption.
+
+### 5.5 Interpretation Summary
+
+The OLS and stepwise models serve the interpretation objective of Section 5: understanding *which variables* drive long-term customer revenue and *in which direction*. The key findings to report here connect back to both the EDA (Section 2.10) and the classification results (Section 3):
+
+```{r}
+interp_reg_summary <- data.frame(
+  Model = c("OLS Full", "OLS Stepwise"),
+  RMSE  = c(
+    postResample(ols_pred,  test_df$log_TotalCharges)["RMSE"],
+    postResample(step_pred, test_df$log_TotalCharges)["RMSE"]
+  ),
+  R2 = c(
+    postResample(ols_pred,  test_df$log_TotalCharges)["Rsquared"],
+    postResample(step_pred, test_df$log_TotalCharges)["Rsquared"]
+  )
+)
+
+knitr::kable(interp_reg_summary, digits = 3,
+             caption = "Regression Performance: Interpretable Models")
+```
+
+Both models achieve RMSE = 0.888 and R² = 0.659 on the test set. The stepwise model's performance is indistinguishable from the full OLS despite using one fewer predictor, confirming that gender carries no information about cumulative customer revenue. The stepwise model is therefore preferred for its marginal parsimony advantage. An R² of 0.659 means the model explains approximately 66% of variance in log(TotalCharges) using only service and demographic variables — a strong result given that the mechanical drivers (tenure and monthly charges) were intentionally excluded. The remaining 34% of unexplained variance reflects the portion of cumulative revenue that is driven by how long customers stay and what they pay monthly — precisely the variables we set aside to isolate the structural component of long-term value. These interpretable models serve their purpose in Section 5: identifying which variables matter and in which direction. Whether regularisation or tree-based methods can improve on RMSE = 0.888 is the question Section 6 addresses
+
+## 6. Advanced Regression — Modelling and Prediction
+
+### 6.1 Setup
+
+```{r}
+# Prepare predictor matrix for glmnet (requires numeric matrix input)
+# model.matrix handles factor encoding automatically
+x_train <- model.matrix(reg_formula, data = train_df)[, -1]
+y_train  <- train_df$log_TotalCharges
+
+x_test  <- model.matrix(reg_formula, data = test_df)[, -1]
+y_test  <- test_df$log_TotalCharges
+```
+
+### 6.2 Ridge Regression
+
+Ridge regression shrinks all coefficients toward zero but retains all predictors.
+
+```{r}
+set.seed(123)
+ridge_cv <- cv.glmnet(x_train, y_train, alpha = 0, standardize = TRUE)
+
+plot(ridge_cv)
+cat("Best lambda (Ridge):", ridge_cv$lambda.min, "\n")
+cat("Lambda 1se (Ridge):", ridge_cv$lambda.1se, "\n")
+
+ridge_pred <- predict(ridge_cv, newx = x_test, s = "lambda.min")
+postResample(pred = as.vector(ridge_pred), obs = y_test)
+```
+
+The Ridge CV plot shows MSE decreasing monotonically toward larger λ values, with lambda.min selected at the far right of the grid. This indicates that shrinkage does not improve on OLS — the model's coefficients are already stable and the predictors are not sufficiently collinear to benefit from regularisation. This is consistent with the stepwise OLS result in Section 5.3, where only one variable (gender) was dropped, suggesting the feature set is already parsimonious. The Ridge RMSE is expected to be very close to the OLS baseline.
+
+### 6.3 Lasso Regression
+
+Lasso applies an L1 penalty that forces some coefficients to exactly zero, performing automatic variable selection.
+
+```{r}
+set.seed(123)
+lasso_cv <- cv.glmnet(x_train, y_train, alpha = 1, standardize = TRUE)
+
+plot(lasso_cv)
+cat("Best lambda (Lasso):", lasso_cv$lambda.min, "\n")
+```
+
+```{r}
+lasso_pred <- predict(lasso_cv, newx = x_test, s = "lambda.min")
+postResample(pred = as.vector(lasso_pred), obs = y_test)
+```
+
+```{r}
+lasso_coefs <- coef(lasso_cv, s = "lambda.min")
+lasso_nonzero <- lasso_coefs[lasso_coefs[, 1] != 0, , drop = FALSE]
+cat("Non-zero coefficients retained by Lasso:", nrow(lasso_nonzero) - 1, "\n")
+print(lasso_nonzero)
+```
+
+Contrary to what the CV plot might suggest visually, Lasso retains all 20 predictors at lambda.min — no coefficient is shrunk to exactly zero. This is a stronger statement than the Ridge result: not only does shrinkage not improve on OLS (Ridge finding), but the data contains no redundant or noise predictors that Lasso would eliminate. Every service and demographic variable contributes genuine signal to predicting log(TotalCharges). The Lasso coefficients are nearly identical to the OLS estimates from Section 5.3, providing independent validation that the stepwise model was already well-calibrated. The only difference is marginal shrinkage applied uniformly across all coefficients — gender, which had the smallest OLS coefficient (0.016), is the most shrunken (0.012) but not eliminated.
+
+### 6.4 Elastic Net
+
+Elastic Net combines the L1 and L2 penalties, mixing Lasso's variable selection with Ridge's grouping behaviour.
+
+```{r}
+set.seed(123)
+enet_cv <- cv.glmnet(x_train, y_train, alpha = 0.5, standardize = TRUE)
+
+plot(enet_cv)
+cat("Best lambda (Elastic Net, alpha=0.5):", enet_cv$lambda.min, "\n")
+
+enet_pred <- predict(enet_cv, newx = x_test, s = "lambda.min")
+postResample(pred = as.vector(enet_pred), obs = y_test)
+```
+
+```{r}
+enet_coefs <- coef(enet_cv, s = "lambda.min")
+cat("Variables retained by Elastic Net at lambda.min:", 
+    sum(coef(enet_cv, s = "lambda.min")[-1] != 0), "\n")
+```
+
+The Elastic Net CV plot shows the same pattern as Ridge and Lasso — MSE stabilises quickly and the curve is flat across a wide range of λ values. Despite the plot suggesting 17 predictors at lambda.min, checking the actual coefficients confirms all 20 predictors are retained with no coefficient exactly zeroed. This is consistent with the Lasso finding and confirms the unified message across all three regularisation methods: this dataset does not benefit from penalisation. The predictors are well-specified, individually meaningful, and the OLS estimates are already stable. Regularisation adds bias without reducing variance sufficiently to justify the trade-off. All three methods — Ridge, Lasso, and Elastic Net — are expected to produce RMSE near the OLS baseline of 0.888, which the final comparison table in Section 6.9 will confirm.
+
+### 6.5 Principal Components Regression (PCR)
+
+PCR replaces the original predictors with a smaller set of principal components before regressing.
+
+```{r}
+# PCR requires scaled data and specific matrix format
+pp <- preProcess(x_train, method = c("center", "scale"))
+x_train_sc <- predict(pp, x_train)
+x_test_sc  <- predict(pp, x_test)
+
+pcr_train_df <- data.frame(log_TotalCharges = y_train, x_train_sc)
+pcr_test_df  <- data.frame(x_test_sc)
+
+pcr_fit <- pcr(log_TotalCharges ~ ., 
+               data = pcr_train_df, 
+               scale = FALSE, 
+               validation = "CV")
+
+pcr_ncomp <- pls::selectNcomp(pcr_fit, method = "onesigma", plot = TRUE)
+cat("Best number of components (PCR):", pcr_ncomp, "\n")
+
+pcr_pred <- drop(predict(pcr_fit, newdata = pcr_test_df, ncomp = pcr_ncomp))
+postResample(pred = pcr_pred, obs = y_test)
+```
+
+PCR selects 18 components out of 20 available before reaching near-OLS performance (RMSEP ≈ 0.92). The curve drops steeply in the first 3–4 components but then continues declining slowly all the way to 18, never fully plateauing until almost all components are included. This is a clear signal that the original predictors carry largely independent information — each variable contributes something unique that PCA cannot compress away without losing predictive power. Dimensionality reduction is therefore not beneficial here: you need almost as many components as original predictors to achieve the same result as OLS. This is consistent with the regularisation findings — the feature set is already parsimonious and well-specified, with no redundancy that any method can exploit to improve on the OLS baseline.
+
+### 6.6 Partial Least Squares (PLS)
+
+PLS constructs components like PCR, but uses the response variable when building them, it finds directions in predictor space that are most predictive of the target, not just most variable.
+
+```{r}
+pls_fit <- plsr(log_TotalCharges ~ .,
+                data = pcr_train_df,
+                scale = FALSE,
+                validation = "CV")
+
+pls_ncomp <- pls::selectNcomp(pls_fit, method = "onesigma", plot = TRUE)
+cat("Best number of components (PLS):", pls_ncomp, "\n")
+
+pls_pred <- drop(predict(pls_fit, newdata = pcr_test_df, ncomp = pls_ncomp))
+postResample(pred = pls_pred, obs = y_test)
+```
+
+PLS selects only 3 components (onesigma rule) to achieve near-OLS performance — a dramatic reduction from the 18 components required by PCR. The curve drops sharply in the first 3 components and then completely flattens, meaning additional components contribute negligible improvement. This confirms the theoretical advantage of PLS over PCR: by incorporating the response variable when constructing components, PLS immediately identifies the most predictively relevant directions in predictor space. The first 3 PLS components capture the dominant structure of the relationship between service subscriptions and log(TotalCharges) — most likely driven by contract type, internet service, and service add-ons, which together explain the bulk of the variance. Despite using only 3 components versus 20 original predictors, PLS matches OLS performance, making it the most efficient dimensionality reduction method in this analysis.
+
+### 6.7 Regression Tree
+
+Having established that regularisation and dimensionality reduction offer no improvement over OLS, we turn to tree-based methods, which do not assume linearity and may capture interactions between service variables that linear models cannot.
+
+A regression tree predicts log(TotalCharges) using binary splits, producing piecewise-constant predictions. It captures non-linearities and interactions automatically but can overfit — pruning via cross-validation addresses this.
+
+```{r}
+reg_tree_big <- tree(
+  reg_formula,
+  data    = train_df,
+  control = tree.control(nobs = nrow(train_df), mindev = 0, minsize = 5)
+)
+
+set.seed(123)
+reg_tree_cv <- cv.tree(reg_tree_big)
+
+tibble(size = reg_tree_cv$size, cv_error = reg_tree_cv$dev) %>%
+  ggplot(aes(x = size, y = cv_error)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  labs(title = "Pruning Curve: CV Deviance vs Tree Size",
+       x = "Number of Terminal Nodes",
+       y = "CV Deviance") +
+  theme_minimal()
+
+min_dev_reg   <- min(reg_tree_cv$dev, na.rm = TRUE)
+best_size_reg <- min(reg_tree_cv$size[reg_tree_cv$dev == min_dev_reg], na.rm = TRUE)
+cat("Optimal regression tree size:", best_size_reg, "terminal nodes\n")
+
+reg_tree_pruned <- prune.tree(reg_tree_big, best = best_size_reg)
+
+plot(reg_tree_pruned)
+text(reg_tree_pruned, cex = 0.75)
+title(paste("Pruned Regression Tree —", best_size_reg, "terminal nodes"))
+
+reg_tree_pred <- predict(reg_tree_pruned, newdata = test_df)
+postResample(pred = reg_tree_pred, obs = y_test)
+```
+
+The pruned regression tree uses 10 terminal nodes with DeviceProtection at the root — an interesting divergence from the OLS finding where Contract dominated. The tree captures interactions between service variables (DeviceProtection × MultipleLines × Contract) that linear models represent additively but trees represent as distinct customer segments. Despite this, test RMSE of 1.022 is substantially worse than OLS (0.888), confirming that the relationship between service subscriptions and log(TotalCharges) is better described by smooth additive effects than piecewise-constant regions. The pruning curve (Image 2) follows the same pattern as the classification tree — error drops sharply within the first few nodes and flattens — but the flat minimum level is higher than OLS, meaning no tree size recovers linear model performance.
+
+### 6.8 Random Forest Regression
+
+The regression tree is a single model and may be unstable. The Random Forest corrects this by averaging 500 trees, if non-linear signal exists in this data, the RF is most likely to find it.
+
+```{r}
+p_reg <- sum(!names(train_df) %in% 
+               c("log_TotalCharges", "TotalCharges", "Churn", 
+                 "tenure", "MonthlyCharges"))
+
+set.seed(123)
+rf_reg <- randomForest(
+  reg_formula,
+  data       = train_df,
+  mtry       = floor(p_reg / 3),  # default for regression: p/3
+  ntree      = 500,
+  importance = TRUE
+)
+
+print(rf_reg)
+
+rf_reg_pred <- predict(rf_reg, newdata = test_df)
+postResample(pred = rf_reg_pred, obs = y_test)
+
+varImpPlot(rf_reg,
+           main = "Random Forest Regression — Variable Importance",
+           cex  = 0.8)
+```
+
+Random Forest beats OLS. RMSE = 0.847 vs 0.888, R² = 0.690 vs 0.659. Not a dramatic improvement but a genuine one. The OOB variance explained (66.9%) closely matches the test R², confirming no overfitting. This improvement suggests that while the relationship is largely linear, there are mild non-linear interactions between service variables that the RF captures through its ensemble of diverse trees — interactions that all linear methods, regularisation, and dimensionality reduction missed.
+
+The variable importance plot confirms strong consistency with Section 5. Contract dominates on both %IncMSE and IncNodePurity — permuting contract type causes the largest accuracy drop across all 500 trees, mirroring its dominant OLS coefficient. MultipleLines, PaymentMethod, Partner, and InternetService follow, all appearing in the top predictors across both metrics. Gender ranks last on %IncMSE, independently confirming the stepwise and Lasso findings that it carries no signal. DeviceProtection ranks second on IncNodePurity — explaining why it appeared at the root of the single regression tree — though its %IncMSE rank is lower, suggesting its node purity contribution is partly driven by how it interacts with other variables rather than its standalone predictive power.
+
+### 6.9 Final Model Comparison
+
+The key question is no longer whether regularisation or dimensionality reduction can beat OLS — they cannot, as Sections 6.2–6.6 confirmed. The question is whether tree-based methods capture non-linear or interaction signal that all linear methods miss. If RF improves meaningfully on RMSE = 0.888, non-linearity matters. If not, the OLS model is the definitive answer for this dataset.
+
+```{r}
+reg_results <- tibble(
+  Model = c("OLS Full", "OLS Stepwise", 
+            "Ridge", "Lasso", "Elastic Net",
+            "PCR", "PLS",
+            "Regression Tree", "Random Forest"),
+  RMSE = c(
+    postResample(ols_pred,              y_test)["RMSE"],
+    postResample(step_pred,             y_test)["RMSE"],
+    postResample(as.vector(ridge_pred), y_test)["RMSE"],
+    postResample(as.vector(lasso_pred), y_test)["RMSE"],
+    postResample(as.vector(enet_pred),  y_test)["RMSE"],
+    postResample(pcr_pred,              y_test)["RMSE"],
+    postResample(pls_pred,              y_test)["RMSE"],
+    postResample(reg_tree_pred,         y_test)["RMSE"],
+    postResample(rf_reg_pred,           y_test)["RMSE"]
+  ),
+  R2 = c(
+    postResample(ols_pred,              y_test)["Rsquared"],
+    postResample(step_pred,             y_test)["Rsquared"],
+    postResample(as.vector(ridge_pred), y_test)["Rsquared"],
+    postResample(as.vector(lasso_pred), y_test)["Rsquared"],
+    postResample(as.vector(enet_pred),  y_test)["Rsquared"],
+    postResample(pcr_pred,              y_test)["Rsquared"],
+    postResample(pls_pred,              y_test)["Rsquared"],
+    postResample(reg_tree_pred,         y_test)["Rsquared"],
+    postResample(rf_reg_pred,           y_test)["Rsquared"]
+  ),
+  MAE = c(
+    postResample(ols_pred,              y_test)["MAE"],
+    postResample(step_pred,             y_test)["MAE"],
+    postResample(as.vector(ridge_pred), y_test)["MAE"],
+    postResample(as.vector(lasso_pred), y_test)["MAE"],
+    postResample(as.vector(enet_pred),  y_test)["MAE"],
+    postResample(pcr_pred,              y_test)["MAE"],
+    postResample(pls_pred,              y_test)["MAE"],
+    postResample(reg_tree_pred,         y_test)["MAE"],
+    postResample(rf_reg_pred,           y_test)["MAE"]
+  )
+) %>%
+  arrange(RMSE)
+
+knitr::kable(reg_results, digits = 4,
+             caption = "Regression Model Comparison (sorted by RMSE)")
+```
+
+```{r}
+reg_results %>%
+  ggplot(aes(x = reorder(Model, -RMSE), y = RMSE, fill = RMSE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "steelblue", high = "tomato") +
+  labs(title = "Regression Model Comparison",
+       x = NULL, y = "Test RMSE") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The comparison table confirms the narrative built across Sections 6.2–6.8. Random Forest achieves the lowest RMSE (0.847) and highest R² (0.690), beating every other method. The improvement over OLS is modest but genuine — 0.041 RMSE points — suggesting mild non-linear interactions between service variables that linear methods cannot capture.
+
+The middle cluster — Elastic Net, Lasso, OLS Full, OLS Stepwise, and Ridge — all achieve virtually identical RMSE (\~0.888), confirming the core finding from Sections 6.2–6.4: regularisation adds nothing when the feature set is already well-specified and stable. The differences within this cluster are negligible and well within sampling variability.
+
+PCR and PLS perform slightly worse than OLS (RMSE 0.896 and 0.900 respectively), despite PLS requiring only 3 components. This reveals a subtle trade-off: PLS is highly efficient in terms of components needed, but the compression itself introduces a small information loss that costs predictive accuracy at the margin.
+
+The Regression Tree is the clear worst performer (RMSE 1.022, R² 0.548) — piecewise-constant predictions with 10 nodes cannot replicate the smooth additive structure that OLS captures directly. This is a case where a simpler linear model genuinely outperforms a more complex non-linear one.
+
+Recommended model: Random Forest for prediction tasks where accuracy is the priority. OLS Stepwise for any context requiring interpretability — it achieves near-identical performance to all regularisation methods while providing directly readable coefficients. The practical difference between these two recommendations is only 0.041 RMSE on the log scale, which may not justify the complexity cost of RF in a production setting.
+
+## 7. Conclusions and Limitations
+
+This project applied a comprehensive series of supervised learning models to the IBM Telco Customer Churn dataset, looking for two parallel analytical objectives:
+
+1.  Trying to predict which customers will churn,
+2.  Understand what drives long-term customer revenue.
+
+### A Unified Story
+
+The classification and regression analyses tell us something important *together*.
+
+**Contract type** sits at the top of nearly every model across both tasks: the root split in the decision tree, the largest odds ratio in logistic regression, the dominant coefficient in every regression model. **Tenure** follows the same pattern: it reduces churn odds by \~3.5% per month *and* compounds directly into higher TotalCharges over time.
+
+This reflects a single underlying phenomenon: **customer commitment**.
+
+A customer on a two-year contract is not just less likely to leave, they also generate 222% more cumulative revenue than a month-to-month customer. The two targets are two facets of the same business question, making contract type the single most powerful lever available to the company.
+
+### Classification
+
+Standard models at the default threshold of 0.5 achieved \~80% accuracy but only 53% Sensitivity, illustrating why accuracy is a misleading metric in imbalanced settings.
+
+All three correction mechanisms: threshold adjustment, downsampling, and upsampling, reduced expected cost by at least 30% over the baseline. Resampling pushes Sensitivity to \~93% at the cost of Specificity falling to 55%; threshold adjustment at 0.30 achieves a more balanced profile (Sensitivity 0.771, Specificity 0.764). **The choice between them is a business decision, not a modelling one.**
+
+Three variables emerged as dominant churn drivers with striking consistency across all methods: **Contract type**, **Internet Service** (Fiber optic customers are 7.5× more likely to churn than DSL), and **Tenure**. The pruned decision tree distilled this into one actionable insight: *new Fiber optic month-to-month customers with tenure under 13.5 months* are the single highest-risk segment.
+
+### Regression
+
+The OLS model explains **65.9% of variance** in log(TotalCharges) using only service and demographic predictors a strong result given that the mechanical drivers (tenure and monthly charges) were intentionally excluded. Contract type dominates, and every service add-on contributes positively. **Gender** is the only predictor carrying no signal, confirmed independently by stepwise selection, Lasso, and the Random Forest importance plot.
+
+Regularisation methods offered no improvement over OLS since the feature set is already parsimonious. PLS matched OLS performance with just 3 components. The **Random Forest** was the only method to meaningfully beat OLS (RMSE 0.847 vs. 0.888, R² 0.690 vs. 0.659), suggesting mild non-linear interactions that linear methods cannot capture.
+
+### Limitations and Future Work
+
+The **cost matrix ratio** (FN=50, FP=10) is an assumption. Our sensitivity analysis across different ratios would test whether model rankings hold. Threshold selection was guided by ROC analysis rather than cross-validated optimisation. The dataset is **cross-sectional**: a longitudinal panel would allow modelling how churn risk evolves over time.
+
+### Final Recommendation
+
+For **churn prediction**: use resampled logistic regression when minimising financial loss is the sole objective; use threshold-adjusted logistic regression (threshold = 0.30) when interpretability or a fixed retention budget are priorities.
+
+For **revenue prediction**: use OLS Stepwise when explainability is needed; use Random Forest when prediction accuracy takes priority, though the 0.041 RMSE difference may not justify the added complexity in production.
+
+**Contract type is the single most powerful lever available to the company.** Moving customers from month-to-month to longer-term contracts simultaneously reduces churn risk and increases lifetime value, making it the highest-return retention strategy available.
+
+## 8. References
+
+Reichheld, F. F., & Schefter, P. (2000). E-loyalty: Your secret weapon on the Web. Harvard Business Review, 78(4), 105–113.
+
+IBM. (2019). Telco Customer Churn Dataset. IBM Community. https://community.ibm.com/community/user/businessanalytics/blogs/steven-macko/2019/07/11/telco-customer-churn-1113
